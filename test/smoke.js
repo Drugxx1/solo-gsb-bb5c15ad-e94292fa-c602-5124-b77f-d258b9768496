@@ -26,6 +26,7 @@ async function check(name, fn) {
     if (!body.includes('键盘焦点路线实验室')) throw new Error('缺少页面标题');
     if (!body.includes('模态审计')) throw new Error('缺少模态审计标签页');
     if (!body.includes('视觉顺序')) throw new Error('缺少视觉顺序审计标签页');
+    if (!body.includes('控件名称审计')) throw new Error('缺少控件名称审计标签页');
   });
 
   await check('GET /analyzer.js 可加载', async () => {
@@ -35,6 +36,10 @@ async function check(name, fn) {
     if (!body.includes('computeOrder')) throw new Error('分析脚本内容异常');
     if (!body.includes('computeModalCycle')) throw new Error('缺少模态审计逻辑');
     if (!body.includes('auditVisualOrder')) throw new Error('缺少视觉顺序审计逻辑');
+    if (!body.includes('computeNameAudit') || !body.includes('pickNameSource')) {
+      throw new Error('缺少控件名称审计逻辑');
+    }
+    if (!body.includes('name-missing-id')) throw new Error('缺少名称引用诊断');
     if (!body.includes('buildShadowDiagnostics')) throw new Error('缺少 Shadow DOM 诊断逻辑');
     if (!body.includes('assignedElements')) throw new Error('缺少 slot 组合树展开');
     if (!body.includes('shadow-closed-undetermined')) throw new Error('缺少 closed 根不可检查标记');

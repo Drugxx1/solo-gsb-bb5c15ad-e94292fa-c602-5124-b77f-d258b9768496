@@ -15,7 +15,7 @@ DOM 嵌套（`details`、`fieldset[disabled]` 等）与 **Shadow DOM / slot 组�
 相邻 Tab 对：按行与文档 LTR/RTL 方向建立视觉顺序，找出与 Tab 路线相邻却逆向跳转的
 焦点对；零尺寸 / 矩形重叠 / 行归属不唯一 / 跨滚动容器的节点标为无法判定，不计作无偏差），
 可一键导出「节点（含宿主链 / slot 来源）/ 顺序 / 诊断 / 基线对比 / 模态审计 /
-视觉顺序审计 / 组合树汇总」JSON 报告。
+视觉顺序审计 / 控件名称审计 / 组合树汇总」JSON 报告。
 **closed shadow root 明确标记为不可检查，实验室不猜测其内部焦点顺序。**
 
 ## 快速开始（Docker）
@@ -138,6 +138,33 @@ npm run smoke      # 冒烟测试（需服务已启动）
     （`cross-scroll-container`；该标记不影响此节点与同容器相邻节点的评判）；
   - 点击偏差项会**依次高亮**前后两个节点（复用现有预览高亮），
     点击无法判定项高亮对应节点；标签角标计数 = 偏差数 + 无法判定数。
+- **控件名称审计**：新增「控件名称审计」标签页，审计范围严格限定为
+  **`<button>`、`<a href>` 与 `<input type="text">`**
+  （无 `href` 的锚点、`checkbox` / `hidden` / `email` 等其他类型 input 不参与；
+  `type` 缺省或非法值由浏览器归一化为 `text`，照样计入）。
+  - **名称来源优先级**：`aria-labelledby` → `aria-label` → 原生 `<label>`
+    （仅文本框：`label[for]` 与包裹型 label，多个 label 按文档序合并）→
+    **内容**（按钮 / 链接的组合树文本）→ `title`，取**首个折叠空白后非空**
+    的结果并展示其来源；空白一律折叠（制表 / 换行 / 连续空白合并为单空格）。
+  - **ID 引用解析作用域**：`aria-labelledby` / `label[for]` 的 ID **仅在控件所属
+    Document / ShadowRoot 内解析，不跨 shadow 边界**；`aria-labelledby` 多引用
+    **按声明顺序拼接**；ID 在所属树作用域内缺失时给出
+    「缺失 ID」诊断（该引用跳过，后续来源仍可兜底）；**ID 对应多个节点
+    （重复 ID）时名称无法判定**，标记为「歧义」且不再回退后续来源；
+    文本框自身 `id` 重复时 `label[for]` 关联同样无法判定。
+  - **组合树文本读取**：名称文本沿 **open Shadow DOM 与 `<slot>` 组合树**读取
+    （有 open shadowRoot 读 shadow 子树；slot 有分配节点读分配节点，
+    否则读 fallback；**未分配轻 DOM 被忽略**）；**普通内容**跳过 `hidden`、
+    `display:none`、`visibility:hidden`（含 `collapse`）的**子树**；
+    **被 ID 直接引用的目标节点**（`aria-labelledby` / `label[for]`）即使被隐藏，
+    也取其**整棵子树文字**；引用目标**不再追随**其自身的
+    `aria-labelledby` / `aria-label`（不做名称递归）。
+  - 列表展示每个控件的**名称、来源徽章、Tab 序号 / 排除状态**、ID 引用明细
+    （命中 / 缺失 / 重复）与**缺名 / 歧义原因**；标签角标计数 = 缺名数 + 歧异数；
+    未分配轻 DOM、被抑制的 slot fallback 子树不渲染、不参与审计；
+    closed 根宿主轻 DOM 控件物理可达，照常审计（其「是否渲染不可确定」
+    由 closed 徽章另行表达）。**点击任一控件条目即在预览中高亮**
+    （在 Tab 顺序中用实线框 + 序号，被排除 / 仅编程聚焦者用虚线框）。
 - **导出 JSON**：`POST /api/export` 返回 `Content-Disposition: attachment` 的报告文件；
   接口不可用时退化为浏览器本地下载。已钉基线时，报告包含
   `baselineComparison` 字段：`baseline` / `current` 摘要（时间、统计、节点数）、
@@ -151,6 +178,13 @@ npm run smoke      # 冒烟测试（需服务已启动）
   所在容器与说明）、`undetermined`（无法判定节点：Tab 序号、选择器、原因码、
   所在容器与原因说明）与 `stats`（节点数 / 相邻对数 / 可判定对数 /
   偏差与无法判定计数）。
+  报告包含 `nameAudit` 字段：`items`（每个被审计控件的 `selector` / `tag` /
+  `status` / `step`、`name`、`nameSource`（`aria-labelledby` / `aria-label` /
+  `label` / `content` / `title`）、`nameState`（`named` / `missing` /
+  `ambiguous`）、`refs`（ID 引用明细：属性、ID、`ok`/`missing`/`duplicate`）、
+  `reasons`（缺名 / 缺失 ID / 重复 ID 原因）与组合树徽章 `shadow`）、
+  `diagnostics`（缺名 / 歧义 / 缺失 ID / 重复 ID 汇总诊断）与
+  `stats`（控件数 / 有名称 / 缺名 / 歧义 / 缺失与重复 ID 引用计数）。
   检测到 Shadow DOM 时，报告包含 `shadowDom` 字段（open/closed 根宿主、
   经 slot 分配 / fallback / 未分配 / fallback 抑制计数，closed 根含宿主选择器）；
   每个节点的 `shadow` 对象保留 `hosts`（宿主链：label + 分段选择器）、
@@ -163,18 +197,25 @@ npm run smoke      # 冒烟测试（需服务已启动）
 server.js                 Express：静态托管 + /api/health + /api/export
 public/index.html         应用外壳（编辑器 / 预览 / 结果三栏）
 public/app.js             父页面：DSD 感知净化、srcdoc 装配、postMessage 通信、渲染、
-                          shadow 徽章（宿主链 / slot 来源）、基线面板、模态审计视图、导出
+                          shadow 徽章（宿主链 / slot 来源）、基线面板、模态审计视图、
+                          视觉顺序审计视图、控件名称审计视图、导出
 public/analyzer.js        注入 sandbox iframe：组合树遍历（open shadow / slot 分配 /
                           fallback / 未分配）、焦点模型、分段选择器、节点身份（含宿主链）、
                           closed 根「不可检查」标记、跨边界模态审计、视觉顺序审计
-                          （矩形 / 滚动容器采集、行聚类、LTR/RTL 逆序对检测）、高亮绘制
+                          （矩形 / 滚动容器采集、行聚类、LTR/RTL 逆序对检测）、
+                          控件名称审计（来源优先级、作用域内 ID 引用、组合树文本、
+                          隐藏引用 / 歧义诊断）、高亮绘制
 public/diff.js            基线对比纯函数：节点身份匹配（uid → 指纹 → 歧义未匹配）与差异计算
 test/analyzer.test.js     纯函数单元测试（tabindex 解析 / 排序 / 诊断 / 模态审计）
 test/shadow.test.js       Shadow 纯函数单元测试（分段选择器往返 / 组合树诊断）
 test/diff.test.js         基线对比单元测试（身份匹配 / 移位 / 状态切换 / 歧义）
 test/visual.test.js       视觉顺序审计单元测试（LTR/RTL 行内 / 跨行逆向、行聚类、
                           零尺寸 / 矩形重叠 / 行归属不唯一 / 跨滚动容器）
+test/nameaudit.test.js    控件名称审计单元测试（审计目标 / 空白折叠 / 来源优先级 /
+                          多引用拼接 / 缺失 ID 诊断 / 重复 ID 歧义 / 缺名原因）
 test/shadow-integration.js jsdom 集成：组合树遍历 / slot / closed / 跨边界模态（需可选 jsdom）
+test/nameaudit-integration.js jsdom 集成：名称来源、shadow 作用域 ID、组合树 /
+                          slot 文本、隐藏引用、未分配轻 DOM（需可选 jsdom）
 test/sanitize-dsd.js      jsdom 集成：声明式 Shadow DOM 净化 / 还原（需可选 jsdom）
 test/smoke.js             冒烟测试
 Dockerfile                node:20-alpine，npm install --omit=dev
@@ -182,7 +223,7 @@ docker-compose.yml        单服务，ports 3000:3000
 ```
 
 > 零依赖单元测试：`npm test`（不安装 jsdom）。jsdom 集成验证为可选：
-> `npm install --no-save jsdom && node test/shadow-integration.js && node test/sanitize-dsd.js`
+> `npm install --no-save jsdom && node test/shadow-integration.js && node test/nameaudit-integration.js && node test/sanitize-dsd.js`
 > （jsdom 不支持声明式 `shadowrootmode` 的解析，集成测试用 `attachShadow` 等价构造运行时结构；
 > DSD 模板的保留 / 还原由 `sanitize-dsd.js` 在字符串与 DOMParser 层验证。）
 

@@ -18,12 +18,21 @@
  *     LTR/RTL 方向建立视觉顺序，找出与 Tab 路线相邻却逆向跳转的焦点对；
  *     零尺寸 / 矩形重叠 / 行归属不唯一 / 跨滚动容器的节点标为无法判定，
  *     不计作无偏差；
- *  6. 通过 postMessage 与父页面通信：上报路线、接收高亮指令、绘制高亮框。
+ *  6. 控件名称审计：限 button / a[href] / input[type=text]，名称按
+ *     aria-labelledby → aria-label → 原生 label（文本框）→ 内容（按钮/链接）
+ *     → title 取首个非空结果并折叠空白；ID 引用 / label 关联仅在控件所属
+ *     Document/ShadowRoot 内解析，多引用按声明顺序拼接，缺失 ID 给出诊断，
+ *     引用重复 ID 时无法判定；文本沿 open Shadow DOM / slot 组合树读取，
+ *     忽略未分配轻 DOM，直接引用的隐藏节点取整棵子树文字，普通内容跳过
+ *     hidden / display:none / visibility:hidden 子树，引用目标不再追随
+ *     aria-labelledby；
+ *  7. 通过 postMessage 与父页面通信：上报路线、接收高亮指令、绘制高亮框。
  *
  * 文件顶部的纯函数（parseTabIndexValue / computeOrder / buildDiagnostics /
  * pickActiveModal / computeModalCycle / buildModalDiagnostics /
- * parseRoute / formatRoute / buildShadowDiagnostics / auditVisualOrder）
- * 不依赖 DOM，会在 Node 环境下导出，供单元测试使用。
+ * parseRoute / formatRoute / buildShadowDiagnostics / auditVisualOrder /
+ * isNameAuditTarget / collapseWhitespace / pickNameSource /
+ * buildNameAuditDiagnostics）不依赖 DOM，会在 Node 环境下导出，供单元测试使用。
  */
 (function () {
   'use strict';
@@ -575,6 +584,183 @@
     };
   }
 
+  /* ---------------- 控件名称审计（纯函数） ---------------- */
+
+  /**
+   * 控件名称审计的目标元素集合：
+   *  - <button>（含 type=submit/reset/button 等全部按钮）；
+   *  - 带 href 的 <a>（无 href 的锚点不算链接控件）；
+   *  - 文本类 <input>：DOM 侧传入浏览器归一化后的 el.type——type 缺省 / 空串 /
+   *    非法值都会被浏览器归一化为 text，因此这里只接受归一化后的 'text'，
+   *    email / search / password 等显式其他类型不计。
+   *
+   * @param {string} tagName 标签名（大小写不敏感）
+   * @param {string} [inputType] el.type 的归一化值（仅 input 有意义）
+   * @param {boolean} [hasHref] 是否带 href 属性（仅 a 有意义）
+   */
+  function isNameAuditTarget(tagName, inputType, hasHref) {
+    var tag = String(tagName || '').toLowerCase();
+    if (tag === 'button') return true;
+    if (tag === 'a') return !!hasHref;
+    if (tag === 'input') return String(inputType || 'text').toLowerCase() === 'text';
+    return false;
+  }
+
+  /** 折叠空白：制表 / 换行 / 连续空白合并为单个空格并去除首尾空白 */
+  function collapseWhitespace(s) {
+    return String(s == null ? '' : s).replace(/\s+/g, ' ').trim();
+  }
+
+  /**
+   * 单条 ID 引用（aria-labelledby / label[for]）的诊断信息。
+   * @param {{attr:string, id:string, state:string}} ref state: 'ok'|'missing'|'duplicate'
+   * @returns {{code:string, message:string}|null} ok 引用不产生诊断
+   */
+  function refDiagnostic(ref) {
+    if (!ref) return null;
+    var refLabel = ref.attr === 'label[for]' ? 'label[for] 关联' : ref.attr + ' 引用';
+    if (ref.state === 'missing') {
+      return {
+        code: 'name-missing-id',
+        message: refLabel + '的 ID "' + ref.id +
+          '" 在控件所属 Document/ShadowRoot 内不存在：ID 引用不跨 shadow 边界解析'
+      };
+    }
+    if (ref.state === 'duplicate') {
+      return {
+        code: 'name-duplicate-id',
+        message: 'ID "' + ref.id + '" 在控件所属树作用域内对应多个节点，' +
+          refLabel + '无法判定'
+      };
+    }
+    return null;
+  }
+
+  /** 缺名诊断（按控件种类给出修复提示） */
+  function missingNameReason(tagName) {
+    var tag = String(tagName || '').toLowerCase();
+    if (tag === 'input') {
+      return {
+        code: 'name-missing',
+        message: '文本框缺少可访问名称：请用 <label for> 关联或用 <label> 包裹，' +
+          '或添加 aria-label / aria-labelledby（至少提供 title）'
+      };
+    }
+    var what = tag === 'a' ? '链接' : '按钮';
+    return {
+      code: 'name-missing',
+      message: what + '缺少可访问名称：请提供可见文本内容，或添加 aria-label / ' +
+        'aria-labelledby（至少提供 title）'
+    };
+  }
+
+  /** refs 中非 ok 引用对应的诊断列表 */
+  function brokenRefReasons(refs) {
+    var out = [];
+    (refs || []).forEach(function (r) {
+      var d = refDiagnostic(r);
+      if (d) out.push(d);
+    });
+    return out;
+  }
+
+  /**
+   * 名称来源候选 → 最终名称。候选按优先级排列：
+   * aria-labelledby → aria-label → 原生 label（文本框）→ 内容（按钮/链接）→ title。
+   * 规则：
+   *  - 候选 ambiguous（ID 引用命中重复 ID）→ 整个名称无法判定，立即返回歧义结果
+   *    （不再回退后续来源）；
+   *  - 否则取第一个折叠空白后非空的 name；其前各来源的 refs 全部保留
+   *    （缺失 ID 即便已被后续来源兜底仍给出诊断）；
+   *  - 全部为空 → 缺名。
+   *
+   * @param {Array<{source:string, name:(string|null), ambiguous:boolean, refs:Array}>} candidates
+   * @param {string} tagName 控件标签名（缺名提示按种类区分）
+   * @returns {{name:(string|null), source:(string|null), state:string, refs:Array, reasons:Array}}
+   */
+  function pickNameSource(candidates, tagName) {
+    var refs = [];
+    for (var i = 0; i < (candidates || []).length; i++) {
+      var c = candidates[i];
+      if (c.refs) Array.prototype.push.apply(refs, c.refs);
+      if (c.ambiguous) {
+        return { name: null, source: c.source, state: 'ambiguous', refs: refs, reasons: brokenRefReasons(refs) };
+      }
+      if (c.name) {
+        return { name: c.name, source: c.source, state: 'named', refs: refs, reasons: brokenRefReasons(refs) };
+      }
+    }
+    return {
+      name: null,
+      source: null,
+      state: 'missing',
+      refs: refs,
+      reasons: brokenRefReasons(refs).concat([missingNameReason(tagName)])
+    };
+  }
+
+  /**
+   * 控件名称审计汇总诊断（纯函数）。
+   * @param {Array} items pickNameSource 结果 + { tag, label, selector }
+   */
+  function buildNameAuditDiagnostics(items) {
+    var diags = [];
+    if (!items || items.length === 0) return diags;
+    var missing = [];
+    var ambiguous = [];
+    var missingRefs = [];
+    var dupRefs = [];
+    items.forEach(function (it) {
+      if (it.state === 'missing') missing.push(it);
+      if (it.state === 'ambiguous') ambiguous.push(it);
+      (it.refs || []).forEach(function (r) {
+        if (r.state === 'missing') missingRefs.push({ it: it, r: r });
+        if (r.state === 'duplicate') dupRefs.push({ it: it, r: r });
+      });
+    });
+
+    if (missing.length > 0) {
+      diags.push({
+        level: 'warn',
+        code: 'name-missing-count',
+        message: missing.length + ' 个控件缺少可访问名称（' +
+          missing.slice(0, 5).map(function (x) { return x.label; }).join('，') +
+          (missing.length > 5 ? ' 等' : '') + '）。'
+      });
+    }
+    if (ambiguous.length > 0) {
+      diags.push({
+        level: 'warn',
+        code: 'name-ambiguous-count',
+        message: ambiguous.length + ' 个控件的名称无法判定：ID 引用在控件所属树作用域内命中重复 ID（' +
+          ambiguous.slice(0, 5).map(function (x) { return x.label; }).join('，') +
+          (ambiguous.length > 5 ? ' 等' : '') + '），实验室不猜测其指向。'
+      });
+    }
+    if (missingRefs.length > 0) {
+      var ids = [];
+      missingRefs.forEach(function (m) {
+        var token = m.r.attr + ':"' + m.r.id + '"@' + m.it.label;
+        if (ids.indexOf(token) < 0) ids.push(token);
+      });
+      diags.push({
+        level: 'warn',
+        code: 'name-missing-id-count',
+        message: missingRefs.length + ' 处 ID 引用在控件所属 Document/ShadowRoot 内找不到节点（' +
+          ids.slice(0, 5).join('，') + (ids.length > 5 ? ' 等' : '') +
+          '）：ID 引用不跨 shadow 边界解析，对应名称来源被跳过。'
+      });
+    }
+    if (dupRefs.length > 0) {
+      diags.push({
+        level: 'info',
+        code: 'name-duplicate-id-count',
+        message: dupRefs.length + ' 处 ID 引用命中了同树作用域内的重复 ID，名称按「无法判定」处理。'
+      });
+    }
+    return diags;
+  }
+
   // Node 环境：导出纯函数供测试，随后退出（不触碰 DOM）。
   if (typeof window === 'undefined' || typeof document === 'undefined') {
     if (typeof module !== 'undefined' && module.exports) {
@@ -588,7 +774,13 @@
         pickActiveModal: pickActiveModal,
         computeModalCycle: computeModalCycle,
         buildModalDiagnostics: buildModalDiagnostics,
-        auditVisualOrder: auditVisualOrder
+        auditVisualOrder: auditVisualOrder,
+        isNameAuditTarget: isNameAuditTarget,
+        collapseWhitespace: collapseWhitespace,
+        refDiagnostic: refDiagnostic,
+        missingNameReason: missingNameReason,
+        pickNameSource: pickNameSource,
+        buildNameAuditDiagnostics: buildNameAuditDiagnostics
       };
     }
     return;
@@ -1641,6 +1833,318 @@
     return result;
   }
 
+  /* ---------------- 控件名称审计（DOM） ---------------- */
+
+  /**
+   * 名称文本沿「open Shadow DOM + slot 组合树」读取，规则：
+   *  - 元素存在 open shadowRoot 时读取 shadow 子树，轻 DOM 只经由其中 <slot>
+   *    分配的节点进入组合位置（未分配轻 DOM 被忽略）；
+   *  - <slot> 有分配节点时读取分配节点（转发链递归展开），否则读取 fallback；
+   *  - 普通内容（mode='normal'）跳过子树中 [hidden]、display:none、
+   *    visibility:hidden/collapse 的节点（根节点自身的隐藏不做判断——
+   *    是否可见性由调用方在树上下文中处理）；
+   *  - mode='direct'：节点是被 ID 直接引用的目标（aria-labelledby / label[for]），
+   *    取其整棵子树文字，即使该节点（或其后代）被隐藏也照样读取；
+   *  - 引用目标不再追随 aria-labelledby / aria-label（不做名称递归）；
+   *  - SCRIPT / STYLE / TEMPLATE / NOSCRIPT 内容永远不参与名称文本。
+   */
+  var NAME_NO_TEXT_TAGS = { SCRIPT: true, STYLE: true, TEMPLATE: true, NOSCRIPT: true };
+
+  function nameTextNodeValue(node) {
+    return node.nodeValue == null ? '' : String(node.nodeValue);
+  }
+
+  /** <slot> 分配节点扁平化（含转发链），文本节点与元素都计入 */
+  function flattenAssignedNodes(slot, seen) {
+    seen = seen || new Set();
+    if (seen.has(slot)) return [];
+    seen.add(slot);
+    var out = [];
+    var assigned = typeof slot.assignedNodes === 'function'
+      ? slot.assignedNodes()
+      : Array.prototype.slice.call(slot.childNodes);
+    assigned.forEach(function (n) {
+      if (n.nodeType === 1 && n.tagName === 'SLOT') {
+        out.push.apply(out, flattenAssignedNodes(n, seen));
+      } else {
+        out.push(n);
+      }
+    });
+    return out;
+  }
+
+  /**
+   * @param {Node} root 读取根
+   * @param {'normal'|'direct'} mode normal 跳过隐藏子树；direct 整棵子树照读
+   */
+  function composedText(root, mode) {
+    var direct = mode === 'direct';
+    var parts = [];
+
+    function pushElement(el) {
+      if (!direct && isNameSubtreeHidden(el)) return;
+      var sr = el.shadowRoot;
+      if (sr) {
+        // open shadow root：读 shadow 子树；轻 DOM 仅经其中 slot 分配进入
+        childNodesOf(sr).forEach(walk);
+        return;
+      }
+      if (el.tagName === 'SLOT') {
+        var assigned = flattenAssignedNodes(el);
+        if (assigned.length > 0) {
+          assigned.forEach(walk);
+        } else {
+          childNodesOf(el).forEach(walk);
+        }
+        return;
+      }
+      childNodesOf(el).forEach(walk);
+    }
+
+    function walk(node) {
+      if (!node) return;
+      if (node.nodeType === 3) { // TEXT_NODE
+        parts.push(nameTextNodeValue(node));
+        return;
+      }
+      if (node.nodeType !== 1) return; // 元素节点
+      if (NAME_NO_TEXT_TAGS[node.tagName]) return;
+      pushElement(node);
+    }
+
+    if (root.nodeType === 3) return collapseWhitespace(nameTextNodeValue(root));
+    if (root.nodeType !== 1) return '';
+    pushElement(root);
+    return collapseWhitespace(parts.join(''));
+  }
+
+  function childNodesOf(node) {
+    return Array.prototype.slice.call(node.childNodes || []);
+  }
+
+  /** 元素是否因 [hidden] / display:none / visibility:hidden 而跳过其整棵子树文字 */
+  function isNameSubtreeHidden(el) {
+    if (el.hasAttribute && el.hasAttribute('hidden')) return true;
+    var cs = getComputedStyle(el);
+    if (cs.display === 'none') return true;
+    if (cs.visibility === 'hidden' || cs.visibility === 'collapse') return true;
+    return false;
+  }
+
+  /**
+   * 树作用域内按 id 解析（不跨 shadow 边界）：
+   * ID 引用 / label 关联仅在控件所属 Document/ShadowRoot 内解析。
+   * @returns {{state:'ok'|'missing'|'duplicate', el:(Element|null)}}
+   */
+  function resolveIdInScope(id, root) {
+    var found = root.querySelectorAll('#' + cssEscapeIdent(id));
+    if (found.length === 0) return { state: 'missing', el: null };
+    if (found.length > 1) return { state: 'duplicate', el: null };
+    return { state: 'ok', el: found[0] };
+  }
+
+  /** aria-labelledby：多引用按声明顺序拼接；缺失 ID 诊断；命中重复 ID → 歧义 */
+  function ariaLabelledbyCandidate(el) {
+    var raw = el.getAttribute('aria-labelledby');
+    if (raw === null) return null; // 属性缺省：不参与候选
+    var root = el.getRootNode();
+    var tokens = String(raw).split(/\s+/).filter(Boolean);
+    var refs = [];
+    var ambiguous = false;
+    var pieces = [];
+    tokens.forEach(function (id) {
+      var hit = resolveIdInScope(id, root);
+      refs.push({ attr: 'aria-labelledby', id: id, state: hit.state });
+      if (hit.state === 'duplicate') {
+        ambiguous = true;
+      } else if (hit.state === 'ok') {
+        // 引用目标取整棵子树文字，且不再追随 aria-labelledby / aria-label
+        pieces.push(composedText(hit.el, 'direct'));
+      }
+      // missing：贡献空文本，诊断保留，后续来源仍可兜底
+    });
+    return {
+      source: 'aria-labelledby',
+      name: collapseWhitespace(pieces.join(' ')),
+      ambiguous: ambiguous,
+      refs: refs
+    };
+  }
+
+  function ariaLabelCandidate(el) {
+    if (!el.hasAttribute('aria-label')) return null;
+    return {
+      source: 'aria-label',
+      name: collapseWhitespace(el.getAttribute('aria-label')),
+      ambiguous: false,
+      refs: []
+    };
+  }
+
+  /**
+   * 文本框原生 label（仅 input[type=text]）：
+   *  - 控件 id 在所属树作用域内重复 → 无法判定（label[for] 指向不明）；
+   *  - <label for=id>（同树作用域）+ 包裹型 <label>，按文档序合并；
+   *  - label[for] 指向被隐藏节点时按「直接引用」取整棵子树文字。
+   */
+  function nativeLabelCandidate(el) {
+    var root = el.getRootNode();
+    var refs = [];
+    var labels = [];
+
+    if (el.id) {
+      var idHit = resolveIdInScope(String(el.id), root);
+      if (idHit.state === 'duplicate') {
+        refs.push({ attr: 'label[for]', id: String(el.id), state: 'duplicate' });
+        return { source: 'label', name: null, ambiguous: true, refs: refs };
+      }
+    }
+
+    var forLabels = root.querySelectorAll ? root.querySelectorAll('label[for]') : [];
+    Array.prototype.forEach.call(forLabels, function (lab) {
+      if (el.id && lab.getAttribute('for') === String(el.id) && labels.indexOf(lab) < 0) {
+        labels.push(lab);
+      }
+    });
+
+    // 包裹型 label（祖先链，不跨 shadow 边界）
+    var p = el.parentElement;
+    while (p) {
+      if (p.tagName === 'LABEL') {
+        if (labels.indexOf(p) < 0) labels.push(p);
+        break; // label 不可嵌套，取最近一层
+      }
+      p = p.parentElement;
+    }
+
+    // 按文档序（compareDocumentOrder）合并多个 label
+    labels.sort(function (a, b) {
+      var pos = a.compareDocumentPosition ? a.compareDocumentPosition(b) : 0;
+      if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+      if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+      return 0;
+    });
+
+    var pieces = labels.map(function (lab) {
+      // label 文本：直接引用的 label（含 for 关联）即便被隐藏也取整棵子树文字
+      return composedText(lab, 'direct');
+    });
+    return {
+      source: 'label',
+      name: collapseWhitespace(pieces.join(' ')),
+      ambiguous: false,
+      refs: refs
+    };
+  }
+
+  /** 按钮 / 链接的内容文本（普通内容：跳过隐藏子树） */
+  function contentCandidate(el) {
+    return {
+      source: 'content',
+      name: composedText(el, 'normal'),
+      ambiguous: false,
+      refs: []
+    };
+  }
+
+  function titleCandidate(el) {
+    if (!el.hasAttribute('title')) return null;
+    return {
+      source: 'title',
+      name: collapseWhitespace(el.getAttribute('title')),
+      ambiguous: false,
+      refs: []
+    };
+  }
+
+  /**
+   * 控件名称审计：遍历候选节点（与焦点分析共享 entries，按组合树序），
+   * 限 button / a[href] / input[type=text]；未分配轻 DOM、被抑制的 fallback
+   * 子树不渲染，不参与审计；closed 根宿主轻 DOM 节点物理可达，照常审计
+   * （其「渲染是否存在不可确定」由 closed 徽章另行表达）。
+   */
+  function computeNameAudit() {
+    var items = [];
+    var seen = new Set();
+    entries.forEach(function (e) {
+      var el = e.el;
+      if (seen.has(el)) return;
+      var hasHref = el.tagName === 'A' ? el.hasAttribute('href') : false;
+      if (!isNameAuditTarget(el.tagName.toLowerCase(), el.type, hasHref)) return;
+      seen.add(el);
+      if (unassignedSet.has(el) || suppressedFallbackSet.has(el)) return;
+
+      var candidates = [];
+      var ll = ariaLabelledbyCandidate(el);
+      if (ll) candidates.push(ll);
+      var al = ariaLabelCandidate(el);
+      if (al) candidates.push(al);
+      if (el.tagName === 'INPUT') candidates.push(nativeLabelCandidate(el));
+      if (el.tagName === 'BUTTON' || el.tagName === 'A') candidates.push(contentCandidate(el));
+      var tt = titleCandidate(el);
+      if (tt) candidates.push(tt);
+
+      var picked = pickNameSource(candidates, el.tagName.toLowerCase());
+      items.push({
+        selector: e.selector,
+        label: e.label,
+        tag: e.tag,
+        text: e.text,
+        status: e.status,
+        step: null, // 由调用方按 order 填充
+        shadow: e.shadow,
+        name: picked.name,
+        nameSource: picked.source,
+        nameState: picked.state,
+        refs: picked.refs.map(function (r) {
+          return { attr: r.attr, id: r.id, state: r.state };
+        }),
+        reasons: picked.reasons.map(function (r) {
+          return { code: r.code, message: r.message };
+        })
+      });
+    });
+
+    // 填充 Tab 序号（仅在顺序中的控件）
+    for (var i = 0; i < order.length; i++) {
+      var sel = entries[order[i]].selector;
+      for (var j = 0; j < items.length; j++) {
+        if (items[j].selector === sel) items[j].step = i + 1;
+      }
+    }
+
+    var missingCount = items.filter(function (x) { return x.nameState === 'missing'; }).length;
+    var ambiguousCount = items.filter(function (x) { return x.nameState === 'ambiguous'; }).length;
+    var missingIdCount = 0;
+    var duplicateIdCount = 0;
+    items.forEach(function (x) {
+      x.refs.forEach(function (r) {
+        if (r.state === 'missing') missingIdCount++;
+        if (r.state === 'duplicate') duplicateIdCount++;
+      });
+    });
+    return {
+      items: items,
+      diagnostics: buildNameAuditDiagnostics(items.map(function (x) {
+        // 纯函数以 state / refs 描述审计结果，序列化条目使用 nameState
+        return {
+          state: x.nameState,
+          label: x.label,
+          selector: x.selector,
+          refs: x.refs
+        };
+      })),
+      stats: {
+        controls: items.length,
+        named: items.length - missingCount - ambiguousCount,
+        missing: missingCount,
+        ambiguous: ambiguousCount,
+        missingIdRefs: missingIdCount,
+        duplicateIdRefs: duplicateIdCount
+      }
+    };
+  }
+
   function computeAndSend() {
     try {
       buildEntries();
@@ -1666,6 +2170,7 @@
           diagnostics: diagnostics,
           modalAudit: computeModalAudit(),
           visualAudit: computeVisualAudit(),
+          nameAudit: computeNameAudit(),
           stats: {
             candidates: entries.length,
             ordered: order.length,

@@ -354,3 +354,49 @@ textarea:focus { outline: 2px solid var(--accent-2); outline-offset: -1px; }
 .type-badge.rect-overlap { background: #3d2b12; color: var(--warn); }
 .type-badge.row-ambiguous { background: #2d2440; color: #c792ea; }
 .type-badge.cross-scroll { background: #22304d; color: var(--accent-2); }
+
+/* ---------------- 控件名称审计 ---------------- */
+
+/* 面板整体滚动：不设 display，确保 hidden 属性能正常隐藏面板 */
+.name-panel { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; }
+.name-panel h3 { font-size: 13px; color: var(--muted); margin: 12px 0 6px; }
+.name-meta { margin: 0 0 4px; color: var(--muted); font-size: 12px; }
+.name-list { margin: 0; padding: 0 0 0 4px; list-style: none; flex: 1; min-height: 0; overflow-y: auto; }
+.name-panel .diagnostics-list { flex: none; max-height: 30%; }
+
+/* 名称状态条 */
+.diff-item.name-item.named { border-left-color: var(--ok); }
+.diff-item.name-item.missing { border-left-color: var(--accent); }
+.diff-item.name-item.ambiguous { border-left-color: var(--warn); }
+.type-badge.named { background: #12352b; color: var(--ok); }
+.type-badge.missing { background: #3a2333; color: var(--accent); }
+.type-badge.ambiguous { background: #3d2b12; color: var(--warn); }
+
+.name-value { display: block; margin-top: 2px; font-size: 12.5px; color: var(--text); word-break: break-word; }
+.name-value.missing { color: var(--warn); }
+
+.badge.name-step { background: #22304d; color: var(--accent-2); }
+.badge.name-excluded { background: #2a3550; color: var(--muted); }
+
+/* 名称来源徽章 */
+.badge.name-src { background: #2d2440; color: #c792ea; font-family: var(--mono); }
+.badge.name-src.src-aria-label,
+.badge.name-src.src-labelledby { background: #22304d; color: var(--accent-2); }
+.badge.name-src.src-label { background: #12352b; color: var(--ok); }
+.badge.name-src.src-content { background: #2a3550; color: var(--text); }
+.badge.name-src.src-title { background: #3d2b12; color: var(--warn); }
+
+/* ID 引用明细 */
+.name-ref {
+  display: block;
+  margin-top: 2px;
+  font-size: 11.5px;
+  font-family: var(--mono);
+  color: var(--muted);
+}
+.name-ref.ref-ok { color: var(--ok); }
+.name-ref.ref-missing { color: var(--accent); }
+.name-ref.ref-duplicate { color: var(--warn); }
+
+.name-panel .node-item.active,
+.name-panel .diff-item.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }

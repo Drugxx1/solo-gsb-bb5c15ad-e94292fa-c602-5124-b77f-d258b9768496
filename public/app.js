@@ -15,8 +15,11 @@
  *  7. 视觉顺序审计：展示同一滚动容器内相邻 Tab 对的视觉顺序偏差
  *     （行内逆向 / 跨行逆向）与无法判定节点（零尺寸 / 矩形重叠 /
  *     行归属不唯一 / 跨滚动容器），点击条目联动预览高亮；
- *  8. 汇总报告（含基线摘要、匹配结果与差异、模态审计、视觉顺序审计）
- *     经 POST /api/export 导出为 JSON 附件。
+ *  8. 控件名称审计：限 button / a[href] / input[type=text]，展示名称、
+ *     来源（aria-labelledby / aria-label / 原生 label / 内容 / title）及
+ *     缺名 / 歧义（引用重复 ID）原因，点击条目高亮对应控件；
+ *  9. 汇总报告（含基线摘要、匹配结果与差异、模态审计、视觉顺序审计、
+ *     控件名称审计）经 POST /api/export 导出为 JSON 附件。
  */
 (function () {
   'use strict';
@@ -77,7 +80,14 @@
     visualMeta: document.getElementById('visual-meta'),
     visualDeviationList: document.getElementById('visual-deviation-list'),
     visualUndeterminedList: document.getElementById('visual-undetermined-list'),
-    visualHint: document.getElementById('visual-hint')
+    visualHint: document.getElementById('visual-hint'),
+    tabName: document.getElementById('tab-name'),
+    namePanel: document.getElementById('name-panel'),
+    nameCount: document.getElementById('name-count'),
+    nameMeta: document.getElementById('name-meta'),
+    nameList: document.getElementById('name-list'),
+    nameDiagnosticsList: document.getElementById('name-diagnostics-list'),
+    nameHint: document.getElementById('name-hint')
   };
 
   var state = {
@@ -93,7 +103,8 @@
     diff: null,          // 最近一次基线对比结果（FocusDiff.diffRoutes 返回值）
     modalAudit: null,    // 最近一次模态焦点陷阱审计结果
     visualAudit: null,   // 最近一次视觉顺序审计结果
-    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal' / 'visual'），用于定位高亮失败提示
+    nameAudit: null,     // 最近一次控件名称审计结果
+    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal' / 'visual' / 'name'），用于定位高亮失败提示
   };
 
   /* ---------------- 示例输入 ---------------- */
@@ -163,6 +174,21 @@
     '  <button>确认订阅</button>',
     '  <button>取消</button>',
     '</div>',
+    '',
+    '<!-- 控件名称审计示例 -->',
+    '<h2>控件名称审计示例</h2>',
+    '<label for="uname">用户名：</label><input type="text" id="uname">',
+    '<label><input type="text" placeholder="包裹型 label（无 for）"> 昵称</label>',
+    '<input type="text" aria-label="直接 aria-label 命名">',
+    '<span id="city-lbl">城市</span><input type="text" aria-labelledby="city-lbl">',
+    '<span id="multi-a">账单</span><span id="multi-b" hidden>（隐藏引用目标：整棵子树文字照读）</span>',
+    '<input type="text" aria-labelledby="multi-a multi-b">',
+    '<input type="text" aria-labelledby="no-such-id" title="引用缺失，回退 title">',
+    '<span id="dup">第一个重复 ID</span><span id="dup">第二个重复 ID</span>',
+    '<input type="text" aria-labelledby="dup">',
+    '<button></button>',
+    '<a href="#x" title="仅有 title 的链接"></a>',
+    '<button aria-label="">空白 aria-label（回退内容）</button>',
     '<script>alert("这段用户脚本会被剥离，不会执行")<' + '/script>'
   ].join('\n');
 
@@ -331,6 +357,7 @@
       var missText = '未能在当前预览中定位该节点（可能刚被移除或选择器已变化）。';
       if (state.highlightOrigin === 'modal') setModalHint(missText);
       else if (state.highlightOrigin === 'visual') setVisualHint(missText);
+      else if (state.highlightOrigin === 'name') setNameHint(missText);
       else setDiffHint(missText);
       state.highlightOrigin = null;
     } else if (d.type === 'error') {
@@ -345,6 +372,7 @@
     state.diagnostics = payload.diagnostics || [];
     state.modalAudit = payload.modalAudit || null;
     state.visualAudit = payload.visualAudit || null;
+    state.nameAudit = payload.nameAudit || null;
     state.stats = payload.stats || null;
     state.currentStep = -1;
     renderResults();
@@ -563,6 +591,7 @@
 
     renderModalAudit();
     renderVisualAudit();
+    renderNameAudit();
   }
 
   /* ---------------- 模态焦点陷阱审计 ---------------- */
@@ -927,6 +956,169 @@
     });
   }
 
+  /* ---------------- 控件名称审计 ---------------- */
+
+  var NAME_SOURCE_META = {
+    'aria-labelledby': { label: 'aria-labelledby', cls: 'src-labelledby' },
+    'aria-label': { label: 'aria-label', cls: 'src-aria-label' },
+    'label': { label: '原生 label', cls: 'src-label' },
+    'content': { label: '内容', cls: 'src-content' },
+    'title': { label: 'title', cls: 'src-title' }
+  };
+  var NAME_STATE_META = {
+    named: { label: '有名称', cls: 'named' },
+    missing: { label: '缺名', cls: 'missing' },
+    ambiguous: { label: '歧义', cls: 'ambiguous' }
+  };
+  var NAME_REF_STATE_LABEL = { ok: '命中', missing: '缺失 ID', duplicate: '重复 ID' };
+
+  function setNameHint(text) {
+    els.nameHint.textContent = text || '';
+  }
+
+  function clearNameActive() {
+    var all = els.namePanel.querySelectorAll('.diff-item.active');
+    for (var i = 0; i < all.length; i++) all[i].classList.remove('active');
+  }
+
+  function renderNameAudit() {
+    var audit = state.nameAudit;
+    els.nameList.innerHTML = '';
+    els.nameDiagnosticsList.innerHTML = '';
+    els.nameMeta.textContent = '';
+    setNameHint('');
+
+    if (!audit) {
+      els.nameCount.textContent = '0';
+      var tip0 = document.createElement('li');
+      tip0.className = 'empty-tip';
+      tip0.textContent = '尚无审计结果。';
+      els.nameList.appendChild(tip0);
+      return;
+    }
+
+    var items = audit.items || [];
+    var st = audit.stats || {};
+    // 角标计数 = 缺名 + 歧义（名称无法确定的控件数）
+    els.nameCount.textContent = String((st.missing || 0) + (st.ambiguous || 0));
+    els.nameMeta.textContent =
+      '审计范围：button / a[href] / input[type=text] · 控件 ' + (st.controls || 0) +
+      ' · 有名称 ' + (st.named || 0) +
+      ' · 缺名 ' + (st.missing || 0) +
+      ' · 歧义 ' + (st.ambiguous || 0) +
+      ' · 缺失 ID 引用 ' + (st.missingIdRefs || 0) +
+      ' · 重复 ID 引用 ' + (st.duplicateIdRefs || 0);
+
+    if (items.length === 0) {
+      var tipN = document.createElement('li');
+      tipN.className = 'empty-tip';
+      tipN.textContent = '当前预览中没有 button / a[href] / input[type=text] 控件。';
+      els.nameList.appendChild(tipN);
+    }
+
+    items.forEach(function (item) {
+      var stateMeta = NAME_STATE_META[item.nameState] || { label: item.nameState, cls: '' };
+      var li = document.createElement('li');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'diff-item name-item ' + stateMeta.cls;
+
+      var line = document.createElement('span');
+      var stateBadge = document.createElement('span');
+      stateBadge.className = 'type-badge ' + stateMeta.cls;
+      stateBadge.textContent = stateMeta.label;
+      line.appendChild(stateBadge);
+      line.appendChild(document.createTextNode(' ' + item.label));
+      if (item.step) {
+        var stepBadge = document.createElement('span');
+        stepBadge.className = 'badge name-step';
+        stepBadge.textContent = 'Tab ' + item.step;
+        line.appendChild(stepBadge);
+      } else if (item.status === 'excluded') {
+        var exBadge = document.createElement('span');
+        exBadge.className = 'badge name-excluded';
+        exBadge.textContent = '已排除';
+        line.appendChild(exBadge);
+      } else if (item.status === 'programmatic') {
+        var prBadge = document.createElement('span');
+        prBadge.className = 'badge name-excluded';
+        prBadge.textContent = '仅编程聚焦';
+        line.appendChild(prBadge);
+      }
+      btn.appendChild(line);
+
+      // 名称 + 来源
+      var nameLine = document.createElement('span');
+      nameLine.className = 'name-value' + (item.name ? '' : ' missing');
+      if (item.name) {
+        var srcMeta = NAME_SOURCE_META[item.nameSource] || { label: item.nameSource, cls: '' };
+        var srcBadge = document.createElement('span');
+        srcBadge.className = 'badge name-src ' + srcMeta.cls;
+        srcBadge.textContent = srcMeta.label;
+        nameLine.appendChild(srcBadge);
+        nameLine.appendChild(document.createTextNode(' “' + item.name + '”'));
+      } else if (item.nameState === 'ambiguous') {
+        var ambMeta = item.nameSource ? NAME_SOURCE_META[item.nameSource] : null;
+        nameLine.appendChild(document.createTextNode('⚠ 名称无法判定（' +
+          (ambMeta ? ambMeta.label : 'ID 引用') + '命中重复 ID，不猜测指向）'));
+      } else {
+        nameLine.appendChild(document.createTextNode('⚠ 缺少名称'));
+      }
+      btn.appendChild(nameLine);
+
+      // ID 引用明细（aria-labelledby / label[for]，按声明顺序）
+      (item.refs || []).forEach(function (r) {
+        var refEl = document.createElement('span');
+        refEl.className = 'name-ref ref-' + r.state;
+        refEl.textContent = r.attr + ' → "#' + r.id + '"：' +
+          (NAME_REF_STATE_LABEL[r.state] || r.state);
+        btn.appendChild(refEl);
+      });
+
+      // 缺名 / 歧义原因
+      (item.reasons || []).forEach(function (r) {
+        var rEl = document.createElement('span');
+        rEl.className = 'diff-detail';
+        rEl.textContent = r.message;
+        btn.appendChild(rEl);
+      });
+
+      var sel = document.createElement('span');
+      sel.className = 'sel';
+      sel.textContent = item.selector;
+      btn.appendChild(sel);
+
+      btn.addEventListener('click', function () {
+        clearNameActive();
+        btn.classList.add('active');
+        setNameHint('');
+        state.highlightOrigin = 'name';
+        if (item.step) {
+          sendToFrame({ type: 'highlight', step: item.step - 1 }); // 顺序中的控件：实线 Tab 高亮
+        } else {
+          sendToFrame({ type: 'highlight-node', selector: item.selector });
+        }
+      });
+      li.appendChild(btn);
+      els.nameList.appendChild(li);
+    });
+
+    // 审计诊断（汇总）
+    var diags = audit.diagnostics || [];
+    if (diags.length === 0) {
+      var liD = document.createElement('li');
+      liD.className = 'empty-tip';
+      liD.textContent = '所有控件都有可确定的可访问名称，暂无审计诊断。';
+      els.nameDiagnosticsList.appendChild(liD);
+    }
+    diags.forEach(function (dg) {
+      var li = document.createElement('li');
+      li.className = 'diag ' + (dg.level === 'warn' ? 'warn' : 'info');
+      li.textContent = (dg.level === 'warn' ? '⚠ ' : 'ℹ ') + dg.message;
+      els.nameDiagnosticsList.appendChild(li);
+    });
+  }
+
   /* ---------------- 基线对比 ---------------- */
 
   var DIFF_TYPE_META = {
@@ -1220,6 +1412,13 @@
         undetermined: state.visualAudit.undetermined,
         stats: state.visualAudit.stats
       } : null,
+      // 控件名称审计：button / a[href] / input[type=text] 的名称、来源、
+      // 状态（有名称 / 缺名 / 引用重复 ID 歧义）、ID 引用明细与原因、汇总诊断
+      nameAudit: state.nameAudit ? {
+        items: state.nameAudit.items,
+        diagnostics: state.nameAudit.diagnostics,
+        stats: state.nameAudit.stats
+      } : null,
       // 基线对比：基线摘要 + 匹配结果 + 差异（未钉基线时为 null）
       baselineComparison: state.diff ? {
         baseline: state.diff.baseline,
@@ -1263,6 +1462,7 @@
       excluded: [els.tabExcluded, els.excludedPanel],
       modal: [els.tabModal, els.modalPanel],
       visual: [els.tabVisual, els.visualPanel],
+      name: [els.tabName, els.namePanel],
       baseline: [els.tabBaseline, els.baselinePanel]
     };
     Object.keys(tabs).forEach(function (name) {
@@ -1276,6 +1476,7 @@
   els.tabExcluded.addEventListener('click', function () { switchTab('excluded'); });
   els.tabModal.addEventListener('click', function () { switchTab('modal'); });
   els.tabVisual.addEventListener('click', function () { switchTab('visual'); });
+  els.tabName.addEventListener('click', function () { switchTab('name'); });
   els.tabBaseline.addEventListener('click', function () { switchTab('baseline'); });
 
   /* ---------------- 启动 ---------------- */
@@ -1288,6 +1489,7 @@
   els.css.value = SAMPLE_CSS;
   renderBaselinePanel();
   renderVisualAudit();
+  renderNameAudit();
 
   fetch('/analyzer.js')
     .then(function (res) {
