@@ -14,8 +14,11 @@ DOM 嵌套（`details`、`fieldset[disabled]` 等）与 **Shadow DOM / slot 组�
 并基于预览中的**实际布局矩形**做**视觉顺序审计**（仅比较同一滚动容器内可明确排序的
 相邻 Tab 对：按行与文档 LTR/RTL 方向建立视觉顺序，找出与 Tab 路线相邻却逆向跳转的
 焦点对；零尺寸 / 矩形重叠 / 行归属不唯一 / 跨滚动容器的节点标为无法判定，不计作无偏差），
+还对组合树内的 `button` / `a[href]` / `input[type=text]` 做**控件名称审计**
+（按 aria-labelledby → aria-label → 原生 label → 内容 → title 取首个非空名称，
+id 引用与 label 关联仅在控件所属 Document / ShadowRoot 内解析，文本沿组合树读取），
 可一键导出「节点（含宿主链 / slot 来源）/ 顺序 / 诊断 / 基线对比 / 模态审计 /
-视觉顺序审计 / 组合树汇总」JSON 报告。
+视觉顺序审计 / 控件名称审计 / 组合树汇总」JSON 报告。
 **closed shadow root 明确标记为不可检查，实验室不猜测其内部焦点顺序。**
 
 ## 快速开始（Docker）
@@ -138,6 +141,23 @@ npm run smoke      # 冒烟测试（需服务已启动）
     （`cross-scroll-container`；该标记不影响此节点与同容器相邻节点的评判）；
   - 点击偏差项会**依次高亮**前后两个节点（复用现有预览高亮），
     点击无法判定项高亮对应节点；标签角标计数 = 偏差数 + 无法判定数。
+- **控件名称审计**：「名称审计」标签页对组合树内的 `button`、`a[href]`、
+  `input[type=text]` 逐一计算可访问名称（未分配轻 DOM、被抑制的 fallback、
+  closed 不可确定子树不参与）：
+  - **名称来源优先级**：`aria-labelledby` → `aria-label` → 原生 `<label>`
+    （仅文本框：`label[for]` 同根关联 + 包裹祖先 label）→ 内容（仅按钮 / 链接）
+    → `title`，取**首个非空**结果，所有文本**折叠空白**；
+  - **根内解析**：id 引用与 label 关联仅在控件所属 Document / ShadowRoot 内
+    查找（不跨边界）；`aria-labelledby` 多引用按声明顺序拼接；引用的 id 缺失时
+    给出诊断（名称回退到后续来源）；引用的 id 在根内重复时**无法判定**
+    （不臆测名称，也不再回退）；
+  - **组合树文本**：文本沿 open Shadow DOM 与 slot 组合树读取（展开 shadow
+    内部、按 slot 分配渲染轻 DOM、未分配 slot 用 fallback），忽略未分配轻 DOM；
+    直接引用的隐藏节点取其整棵子树文字，普通内容跳过 `hidden` / `display:none`
+    / `visibility:hidden` 子树；引用目标不再追随其自身的 `aria-labelledby`；
+  - 列表展示每个控件的名称、来源徽章（`aria-labelledby` / `aria-label` /
+    原生 label / 内容 / `title`）与缺名 / 歧义原因（含缺失引用诊断），
+    点击条目联动预览高亮对应控件；标签角标计数 = 缺名数 + 无法判定数。
 - **导出 JSON**：`POST /api/export` 返回 `Content-Disposition: attachment` 的报告文件；
   接口不可用时退化为浏览器本地下载。已钉基线时，报告包含
   `baselineComparison` 字段：`baseline` / `current` 摘要（时间、统计、节点数）、
@@ -151,6 +171,13 @@ npm run smoke      # 冒烟测试（需服务已启动）
   所在容器与说明）、`undetermined`（无法判定节点：Tab 序号、选择器、原因码、
   所在容器与原因说明）与 `stats`（节点数 / 相邻对数 / 可判定对数 /
   偏差与无法判定计数）。
+  报告还包含 `nameAudit` 字段：`scope`（审计范围 `button, a[href], input[type=text]`）、
+  `items`（逐控件：分段选择器、标签、Tab 序号、名称 `name` 与来源 `source`
+  （`aria-labelledby` / `aria-label` / `label` / `content` / `title`）、
+  状态 `status`（`named` / `missing` / `undetermined`）、缺名 / 歧义原因码
+  `reason` 与说明 `message`、引用诊断 `diagnostics`（如缺失 id 的
+  `missing-reference`）、shadow 组合位置）与 `stats`（总数 / 已命名 /
+  缺名 / 无法判定计数）。
   检测到 Shadow DOM 时，报告包含 `shadowDom` 字段（open/closed 根宿主、
   经 slot 分配 / fallback / 未分配 / fallback 抑制计数，closed 根含宿主选择器）；
   每个节点的 `shadow` 对象保留 `hosts`（宿主链：label + 分段选择器）、
@@ -163,18 +190,25 @@ npm run smoke      # 冒烟测试（需服务已启动）
 server.js                 Express：静态托管 + /api/health + /api/export
 public/index.html         应用外壳（编辑器 / 预览 / 结果三栏）
 public/app.js             父页面：DSD 感知净化、srcdoc 装配、postMessage 通信、渲染、
-                          shadow 徽章（宿主链 / slot 来源）、基线面板、模态审计视图、导出
+                          shadow 徽章（宿主链 / slot 来源）、基线面板、模态审计视图、
+                          控件名称审计视图、导出
 public/analyzer.js        注入 sandbox iframe：组合树遍历（open shadow / slot 分配 /
                           fallback / 未分配）、焦点模型、分段选择器、节点身份（含宿主链）、
                           closed 根「不可检查」标记、跨边界模态审计、视觉顺序审计
-                          （矩形 / 滚动容器采集、行聚类、LTR/RTL 逆序对检测）、高亮绘制
+                          （矩形 / 滚动容器采集、行聚类、LTR/RTL 逆序对检测）、
+                          控件名称审计（根内 id / label 解析、组合树文本、
+                          隐藏子树规则）、高亮绘制
 public/diff.js            基线对比纯函数：节点身份匹配（uid → 指纹 → 歧义未匹配）与差异计算
 test/analyzer.test.js     纯函数单元测试（tabindex 解析 / 排序 / 诊断 / 模态审计）
 test/shadow.test.js       Shadow 纯函数单元测试（分段选择器往返 / 组合树诊断）
 test/diff.test.js         基线对比单元测试（身份匹配 / 移位 / 状态切换 / 歧义）
 test/visual.test.js       视觉顺序审计单元测试（LTR/RTL 行内 / 跨行逆向、行聚类、
                           零尺寸 / 矩形重叠 / 行归属不唯一 / 跨滚动容器）
+test/name.test.js         控件名称审计纯函数单元测试（空白折叠 / id 列表解析 /
+                          名称来源优先级裁决）
 test/shadow-integration.js jsdom 集成：组合树遍历 / slot / closed / 跨边界模态（需可选 jsdom）
+test/name-integration.js  jsdom 集成：控件名称审计（来源优先级 / 根内解析 /
+                          缺失与重复引用 / 组合树文本与隐藏子树规则）（需可选 jsdom）
 test/sanitize-dsd.js      jsdom 集成：声明式 Shadow DOM 净化 / 还原（需可选 jsdom）
 test/smoke.js             冒烟测试
 Dockerfile                node:20-alpine，npm install --omit=dev
@@ -182,7 +216,7 @@ docker-compose.yml        单服务，ports 3000:3000
 ```
 
 > 零依赖单元测试：`npm test`（不安装 jsdom）。jsdom 集成验证为可选：
-> `npm install --no-save jsdom && node test/shadow-integration.js && node test/sanitize-dsd.js`
+> `npm install --no-save jsdom && node test/shadow-integration.js && node test/name-integration.js && node test/sanitize-dsd.js`
 > （jsdom 不支持声明式 `shadowrootmode` 的解析，集成测试用 `attachShadow` 等价构造运行时结构；
 > DSD 模板的保留 / 还原由 `sanitize-dsd.js` 在字符串与 DOMParser 层验证。）
 

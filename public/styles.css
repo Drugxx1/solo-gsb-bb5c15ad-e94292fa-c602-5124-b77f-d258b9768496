@@ -354,3 +354,32 @@ textarea:focus { outline: 2px solid var(--accent-2); outline-offset: -1px; }
 .type-badge.rect-overlap { background: #3d2b12; color: var(--warn); }
 .type-badge.row-ambiguous { background: #2d2440; color: #c792ea; }
 .type-badge.cross-scroll { background: #22304d; color: var(--accent-2); }
+
+/* ---------------- 控件名称审计 ---------------- */
+
+/* 面板整体滚动：与模态面板一致，不设 display 以确保 hidden 属性能正常隐藏 */
+.name-panel { flex: 1; min-height: 0; overflow-y: auto; }
+.name-meta { margin: 0 0 8px; color: var(--muted); font-size: 12px; }
+.name-list { margin: 0; padding: 0 0 0 4px; list-style: none; }
+
+.name-item { border-left-width: 3px; }
+.name-item.missing { border-left-color: var(--warn); }
+.name-item.undetermined { border-left-color: #c792ea; }
+.name-item.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+
+.name-value {
+  display: block;
+  margin-top: 2px;
+  color: var(--ok);
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.name-reason { display: block; margin-top: 2px; font-size: 12px; }
+.name-reason.missing { color: var(--warn); }
+.name-reason.undetermined { color: #c792ea; }
+
+.badge.name-src { background: #12352b; color: var(--ok); }
+.badge.name-missing { background: #3d2b12; color: var(--warn); }
+.badge.name-undetermined { background: #2d2440; color: #c792ea; }

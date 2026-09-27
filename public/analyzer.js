@@ -18,11 +18,17 @@
  *     LTR/RTL 方向建立视觉顺序，找出与 Tab 路线相邻却逆向跳转的焦点对；
  *     零尺寸 / 矩形重叠 / 行归属不唯一 / 跨滚动容器的节点标为无法判定，
  *     不计作无偏差；
- *  6. 通过 postMessage 与父页面通信：上报路线、接收高亮指令、绘制高亮框。
+ *  6. 控件名称审计：对组合树内的 button / a[href] / input[type=text]
+ *     计算可访问名称（aria-labelledby → aria-label → 原生 label（文本框）
+ *     → 内容（按钮/链接）→ title，取首个非空结果，折叠空白）；id 引用与
+ *     label 关联仅在控件所属 Document / ShadowRoot 内解析，文本沿 open
+ *     Shadow DOM 与 slot 组合树读取；
+ *  7. 通过 postMessage 与父页面通信：上报路线、接收高亮指令、绘制高亮框。
  *
  * 文件顶部的纯函数（parseTabIndexValue / computeOrder / buildDiagnostics /
  * pickActiveModal / computeModalCycle / buildModalDiagnostics /
- * parseRoute / formatRoute / buildShadowDiagnostics / auditVisualOrder）
+ * parseRoute / formatRoute / buildShadowDiagnostics / auditVisualOrder /
+ * collapseWs / parseIdList / pickNameSource）
  * 不依赖 DOM，会在 Node 环境下导出，供单元测试使用。
  */
 (function () {
@@ -575,6 +581,34 @@
     };
   }
 
+  /* ---------------- 控件名称审计（纯函数部分） ---------------- */
+
+  /** 折叠空白：连续空白（含换行 / 制表）压成单个空格，并去除首尾空白 */
+  function collapseWs(s) {
+    if (s === null || s === undefined) return '';
+    return String(s).replace(/\s+/g, ' ').trim();
+  }
+
+  /** 解析 aria-labelledby 的 id 引用列表（空白分隔，保持声明顺序） */
+  function parseIdList(raw) {
+    var t = collapseWs(raw);
+    return t ? t.split(' ') : [];
+  }
+
+  /**
+   * 名称来源裁决：按优先级取首个非空文本的来源。
+   * @param {Array<{source:string, text:string}>} sources 按优先级排列的候选（文本须已折叠空白）
+   * @returns {{name:(string|null), source:(string|null)}}
+   */
+  function pickNameSource(sources) {
+    var list = sources || [];
+    for (var i = 0; i < list.length; i++) {
+      var s = list[i];
+      if (s && s.text) return { name: s.text, source: s.source };
+    }
+    return { name: null, source: null };
+  }
+
   // Node 环境：导出纯函数供测试，随后退出（不触碰 DOM）。
   if (typeof window === 'undefined' || typeof document === 'undefined') {
     if (typeof module !== 'undefined' && module.exports) {
@@ -588,7 +622,10 @@
         pickActiveModal: pickActiveModal,
         computeModalCycle: computeModalCycle,
         buildModalDiagnostics: buildModalDiagnostics,
-        auditVisualOrder: auditVisualOrder
+        auditVisualOrder: auditVisualOrder,
+        collapseWs: collapseWs,
+        parseIdList: parseIdList,
+        pickNameSource: pickNameSource
       };
     }
     return;
@@ -1641,6 +1678,274 @@
     return result;
   }
 
+  /* ---------------- 控件名称审计（DOM，组合树） ---------------- */
+
+  // 审计范围：仅 button、a[href]、input[type=text]（CSS 选择器字面语义）
+  var NAME_AUDIT_SELECTOR = 'button, a[href], input[type="text"]';
+  var NAME_AUDIT_SCOPE = 'button, a[href], input[type=text]';
+
+  // 名称来源展示标签（父页面渲染与缺名原因说明共用此顺序语义）
+  var NAME_SOURCE_LABELS = {
+    'aria-labelledby': 'aria-labelledby',
+    'aria-label': 'aria-label',
+    'label': '原生 label',
+    'content': '内容',
+    'title': 'title'
+  };
+
+  // 不贡献渲染文本的元素（样式 / 脚本 / 模板内容不是文本）
+  var NAME_TEXT_SKIP_TAGS = { STYLE: true, SCRIPT: true, TEMPLATE: true, NOSCRIPT: true };
+
+  /** 元素自身是否隐藏（hidden 属性 / display:none / visibility:hidden|collapse，不含祖先） */
+  function selfHidden(el) {
+    if (el.hasAttribute('hidden')) return true;
+    var cs = getComputedStyle(el);
+    if (cs.display === 'none') return true;
+    return cs.visibility === 'hidden' || cs.visibility === 'collapse';
+  }
+
+  /** 节点是否处于隐藏子树中（沿组合祖先链：hidden 属性 / display:none / visibility） */
+  function isHiddenNode(el) {
+    if (composedClosest(el, '[hidden]')) return true;
+    var node = el;
+    while (node && node.nodeType === 1) {
+      if (getComputedStyle(node).display === 'none') return true;
+      var p = node.parentElement;
+      if (!p) {
+        var rt = node.getRootNode();
+        if (rt instanceof ShadowRoot) { node = rt.host; continue; }
+        break;
+      }
+      node = p;
+    }
+    var cs = getComputedStyle(el);
+    return cs.visibility === 'hidden' || cs.visibility === 'collapse';
+  }
+
+  /** slot 的扁平化分配节点（含文本节点；转发链由 flatten 展开） */
+  function assignedNodesFlattened(slot) {
+    if (typeof slot.assignedNodes === 'function') {
+      try {
+        return Array.prototype.slice.call(slot.assignedNodes({ flatten: true }));
+      } catch (err) { /* 回退到元素级展开 */ }
+    }
+    return flattenAssigned(slot);
+  }
+
+  /**
+   * 沿组合树收集文本到 out（文本节点原始值依次压入，调用方拼接后折叠空白）：
+   * 展开 open shadowRoot、按 slot 分配（含转发链）渲染轻 DOM、未分配 slot
+   * 用 fallback；未分配的宿主轻 DOM 不进入遍历。
+   * skipHidden 为 true 时跳过 hidden 属性 / display:none / visibility:hidden
+   * 子树（普通内容规则）；为 false 时取整棵子树文字（aria-labelledby
+   * 直接引用隐藏节点的规则）。isRoot 标记的节点自身不做隐藏跳过
+   * （其隐藏与否由调用方在选定 skipHidden 时判定）。
+   */
+  function collectNodeText(node, skipHidden, out, isRoot) {
+    if (node.nodeType === 3) { // 文本节点
+      out.push(node.nodeValue);
+      return;
+    }
+    if (node.nodeType !== 1) return; // 注释等不贡献文本
+    var el = node;
+    if (el.hasAttribute('data-focus-lab')) return; // 实验室自身的高亮覆盖层
+    if (NAME_TEXT_SKIP_TAGS[el.tagName]) return;
+    if (!isRoot && skipHidden && selfHidden(el)) return;
+    var sr = el.shadowRoot;
+    if (sr) {
+      // 组合树：宿主位置渲染的是 shadow 树；轻 DOM 仅经 slot 分配进入
+      var sc = sr.childNodes;
+      for (var i = 0; i < sc.length; i++) collectNodeText(sc[i], skipHidden, out, false);
+      return;
+    }
+    if (el.tagName === 'SLOT') {
+      var assigned = assignedNodesFlattened(el);
+      var list = assigned.length > 0 ? assigned : el.childNodes;
+      for (var j = 0; j < list.length; j++) collectNodeText(list[j], skipHidden, out, false);
+      return;
+    }
+    var kids = el.childNodes;
+    for (var k = 0; k < kids.length; k++) collectNodeText(kids[k], skipHidden, out, false);
+  }
+
+  /**
+   * 元素的组合树文本（折叠空白后）。skipHidden 语义同 collectNodeText；
+   * 元素自身不作为「隐藏子树」跳过（隐藏判定沿其子树进行）。
+   */
+  function composedText(el, skipHidden) {
+    var out = [];
+    collectNodeText(el, skipHidden, out, true);
+    return collapseWs(out.join(''));
+  }
+
+  // 每次名称审计重建：根（Document / ShadowRoot）→ id → 匹配元素数组
+  var nameAuditIdCache = null;
+
+  /** 在控件所属根内按 id 解析（不跨 Document / ShadowRoot 边界）；返回全部匹配 */
+  function findByIdInRoot(root, id) {
+    var map = nameAuditIdCache.get(root);
+    if (!map) { map = new Map(); nameAuditIdCache.set(root, map); }
+    if (map.has(id)) return map.get(id);
+    var out = [];
+    var all = root.querySelectorAll('[id]');
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].id === id) out.push(all[i]);
+    }
+    map.set(id, out);
+    return out;
+  }
+
+  /**
+   * 原生 <label> 关联文本（仅 input[type=text] 使用）：
+   * 同根内 label[for=控件id]（按树序拼接）+ 包裹控件的祖先 label；
+   * 关联仅在控件所属 Document / ShadowRoot 内解析。
+   */
+  function nativeLabelText(el, root) {
+    var texts = [];
+    var seen = [];
+    if (el.id) {
+      var labels = root.querySelectorAll('label[for]');
+      for (var i = 0; i < labels.length; i++) {
+        var lb = labels[i];
+        // label.control 由浏览器按 id 在 label 所属树内解析（重复 id 归首个匹配）；
+        // 环境不支持时回退为 for 属性与控件 id 的字面比较
+        var mine = (typeof lb.control !== 'undefined') ? lb.control === el : lb.htmlFor === el.id;
+        if (mine && seen.indexOf(lb) < 0) {
+          seen.push(lb);
+          texts.push(composedText(lb, true));
+        }
+      }
+    }
+    // 包裹关联：祖先 <label>（物理父链天然不跨根）；label 的 for 指向他处时不算
+    var wrapping = el.closest ? el.closest('label') : null;
+    if (wrapping && seen.indexOf(wrapping) < 0) {
+      var wrapMine = (typeof wrapping.control !== 'undefined')
+        ? wrapping.control === el
+        : (!wrapping.htmlFor || wrapping.htmlFor === el.id);
+      if (wrapMine) texts.push(composedText(wrapping, true));
+    }
+    return collapseWs(texts.join(' '));
+  }
+
+  /**
+   * 计算单个控件的可访问名称：
+   * 优先级 aria-labelledby → aria-label → 原生 label（文本框）→ 内容（按钮/链接）
+   * → title，取首个非空结果（折叠空白）。
+   *  - aria-labelledby 的 id 引用仅在控件所属 Document / ShadowRoot 内解析，
+   *    多引用按声明顺序拼接；缺失 id 记诊断；引用重复 id 时无法判定；
+   *  - 引用目标不再追随其自身的 aria-labelledby，直接读取文本；
+   *    直接引用的隐藏节点取整棵子树文字，否则按普通规则跳过隐藏子树；
+   *  - 文本沿 open Shadow DOM 与 slot 组合树读取，忽略未分配轻 DOM。
+   */
+  function auditControlName(el, entry) {
+    var root = el.getRootNode();
+    var rootKind = (root instanceof ShadowRoot) ? 'ShadowRoot' : 'Document';
+    var diagnostics = [];
+
+    // 1) aria-labelledby：多引用按声明顺序拼接
+    var labelledbyText = '';
+    var duplicate = null;
+    if (el.hasAttribute('aria-labelledby')) {
+      var ids = parseIdList(el.getAttribute('aria-labelledby'));
+      var parts = [];
+      for (var i = 0; i < ids.length; i++) {
+        var matches = findByIdInRoot(root, ids[i]);
+        if (matches.length === 0) {
+          diagnostics.push({
+            code: 'missing-reference',
+            message: 'aria-labelledby 引用的 id "' + ids[i] + '" 在所属 ' + rootKind + ' 内不存在'
+          });
+        } else if (matches.length > 1) {
+          duplicate = { id: ids[i], count: matches.length };
+          break;
+        } else {
+          var ref = matches[0];
+          // 引用目标不再追随其 aria-labelledby；直接引用的隐藏节点取整棵子树文字
+          parts.push(composedText(ref, !isHiddenNode(ref)));
+        }
+      }
+      if (!duplicate) labelledbyText = collapseWs(parts.join(' '));
+    }
+
+    var item = {
+      selector: entry.selector,
+      label: entry.label,
+      tag: el.tagName.toLowerCase(),
+      step: null, // 由 computeNameAudit 填充（1 基 Tab 序号，不在顺序中时为 null）
+      focusStatus: entry.status,
+      name: null,
+      source: null,
+      status: 'named',
+      reason: null,
+      message: '',
+      diagnostics: diagnostics,
+      shadow: entry.shadow
+    };
+
+    // 引用重复 id：无法判定（不臆测名称，也不再回退其他来源）
+    if (duplicate) {
+      item.status = 'undetermined';
+      item.reason = 'duplicate-reference';
+      item.message = 'aria-labelledby 引用的 id "' + duplicate.id + '" 在所属 ' + rootKind +
+        ' 内有 ' + duplicate.count + ' 个匹配，引用目标无法判定';
+      return item;
+    }
+
+    // 2) 按优先级取首个非空来源
+    var sources = [
+      { source: 'aria-labelledby', text: labelledbyText },
+      { source: 'aria-label', text: collapseWs(el.getAttribute('aria-label')) }
+    ];
+    if (el.tagName === 'INPUT') {
+      sources.push({ source: 'label', text: nativeLabelText(el, root) });
+    }
+    if (el.tagName === 'BUTTON' || el.tagName === 'A') {
+      sources.push({ source: 'content', text: composedText(el, true) });
+    }
+    sources.push({ source: 'title', text: collapseWs(el.getAttribute('title')) });
+
+    var picked = pickNameSource(sources);
+    if (!picked.name) {
+      item.status = 'missing';
+      item.reason = 'no-accessible-name';
+      item.message = '缺少可访问名称：' + sources.map(function (s) {
+        return NAME_SOURCE_LABELS[s.source];
+      }).join('、') + ' 均为空';
+      return item;
+    }
+    item.name = picked.name;
+    item.source = picked.source;
+    return item;
+  }
+
+  /**
+   * 控件名称审计：对组合树内的 button / a[href] / input[type=text] 逐一计算
+   * 可访问名称（未分配轻 DOM、被抑制的 fallback、closed 不可确定子树不参与）。
+   */
+  function computeNameAudit() {
+    nameAuditIdCache = new WeakMap();
+    var indexByEl = new Map();
+    for (var i = 0; i < entries.length; i++) indexByEl.set(entries[i].el, i);
+    var stepOf = new Map();
+    for (var s = 0; s < order.length; s++) stepOf.set(order[s], s + 1);
+
+    var items = [];
+    for (var j = 0; j < allElements.length; j++) {
+      var el = allElements[j];
+      if (!el.matches || !el.matches(NAME_AUDIT_SELECTOR)) continue;
+      // 未分配 / fallback 抑制 / closed 不可确定的子树不在组合树渲染范围内
+      if (unassignedSet.has(el) || undeterminedSet.has(el) || suppressedFallbackSet.has(el)) continue;
+      var idx = indexByEl.get(el);
+      if (idx === undefined) continue; // 理论上三类控件均为候选节点
+      var item = auditControlName(el, entries[idx]);
+      item.step = stepOf.has(idx) ? stepOf.get(idx) : null;
+      items.push(item);
+    }
+    var stats = { total: items.length, named: 0, missing: 0, undetermined: 0 };
+    items.forEach(function (it) { stats[it.status]++; });
+    return { scope: NAME_AUDIT_SCOPE, items: items, stats: stats };
+  }
+
   function computeAndSend() {
     try {
       buildEntries();
@@ -1666,6 +1971,7 @@
           diagnostics: diagnostics,
           modalAudit: computeModalAudit(),
           visualAudit: computeVisualAudit(),
+          nameAudit: computeNameAudit(),
           stats: {
             candidates: entries.length,
             ordered: order.length,

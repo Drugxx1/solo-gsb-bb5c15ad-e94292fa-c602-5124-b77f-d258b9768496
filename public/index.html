@@ -60,6 +60,7 @@
         <button class="tab" id="tab-excluded" role="tab" aria-selected="false" type="button">排除与诊断 <span id="excluded-count" class="count">0</span></button>
         <button class="tab" id="tab-modal" role="tab" aria-selected="false" type="button">模态审计 <span id="modal-count" class="count">0</span></button>
         <button class="tab" id="tab-visual" role="tab" aria-selected="false" type="button">视觉顺序 <span id="visual-count" class="count">0</span></button>
+        <button class="tab" id="tab-name" role="tab" aria-selected="false" type="button" title="控件名称审计（button / a[href] / input[type=text]）">名称审计 <span id="name-count" class="count">0</span></button>
         <button class="tab" id="tab-baseline" role="tab" aria-selected="false" type="button">基线对比 <span id="baseline-count" class="count">0</span></button>
       </div>
       <ol id="order-list" class="order-list" aria-label="Tab 顺序"></ol>
@@ -86,6 +87,11 @@
         <h3>无法判定（不计作无偏差）</h3>
         <ul id="visual-undetermined-list" class="visual-list"></ul>
         <p id="visual-hint" class="diff-hint" role="status"></p>
+      </div>
+      <div id="name-panel" class="name-panel" hidden>
+        <p id="name-meta" class="name-meta"></p>
+        <ul id="name-list" class="name-list"></ul>
+        <p id="name-hint" class="diff-hint" role="status"></p>
       </div>
       <div id="baseline-panel" class="baseline-panel" hidden>
         <div class="baseline-toolbar">

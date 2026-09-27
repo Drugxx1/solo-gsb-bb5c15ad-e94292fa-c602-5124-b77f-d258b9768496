@@ -15,8 +15,11 @@
  *  7. 视觉顺序审计：展示同一滚动容器内相邻 Tab 对的视觉顺序偏差
  *     （行内逆向 / 跨行逆向）与无法判定节点（零尺寸 / 矩形重叠 /
  *     行归属不唯一 / 跨滚动容器），点击条目联动预览高亮；
- *  8. 汇总报告（含基线摘要、匹配结果与差异、模态审计、视觉顺序审计）
- *     经 POST /api/export 导出为 JSON 附件。
+ *  8. 控件名称审计：展示组合树内 button / a[href] / input[type=text]
+ *     的可访问名称、名称来源与缺名 / 歧义原因（含 aria-labelledby
+ *     缺失 / 重复引用诊断），点击条目联动预览高亮；
+ *  9. 汇总报告（含基线摘要、匹配结果与差异、模态审计、视觉顺序审计、
+ *     控件名称审计）经 POST /api/export 导出为 JSON 附件。
  */
 (function () {
   'use strict';
@@ -77,7 +80,13 @@
     visualMeta: document.getElementById('visual-meta'),
     visualDeviationList: document.getElementById('visual-deviation-list'),
     visualUndeterminedList: document.getElementById('visual-undetermined-list'),
-    visualHint: document.getElementById('visual-hint')
+    visualHint: document.getElementById('visual-hint'),
+    tabName: document.getElementById('tab-name'),
+    namePanel: document.getElementById('name-panel'),
+    nameCount: document.getElementById('name-count'),
+    nameMeta: document.getElementById('name-meta'),
+    nameList: document.getElementById('name-list'),
+    nameHint: document.getElementById('name-hint')
   };
 
   var state = {
@@ -93,7 +102,8 @@
     diff: null,          // 最近一次基线对比结果（FocusDiff.diffRoutes 返回值）
     modalAudit: null,    // 最近一次模态焦点陷阱审计结果
     visualAudit: null,   // 最近一次视觉顺序审计结果
-    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal' / 'visual'），用于定位高亮失败提示
+    nameAudit: null,     // 最近一次控件名称审计结果
+    highlightOrigin: null // 最近一次 highlight-node 请求来源（'diff' / 'modal' / 'visual' / 'name'），用于定位高亮失败提示
   };
 
   /* ---------------- 示例输入 ---------------- */
@@ -157,6 +167,12 @@
     '</fieldset>',
     '<a>没有 href 的链接（不可聚焦）</a>',
     '<div aria-hidden="true"><button>aria-hidden 内的可聚焦按钮</button></div>',
+    '<!-- 控件名称审计：原生 label / aria-labelledby（多引用拼接，含隐藏节点）/ aria-label -->',
+    '<label for="nick">昵称</label>',
+    '<input id="nick" type="text">',
+    '<span id="submit-part1" hidden>提交</span><span id="submit-part2">订单</span>',
+    '<button aria-labelledby="submit-part1 submit-part2">此内容被 aria-labelledby 覆盖</button>',
+    '<a href="#" aria-label="帮助中心">?</a>',
     '<div role="dialog" aria-modal="true" aria-label="订阅确认" class="demo-modal">',
     '  <p><strong>模态对话框</strong>：打开时模态外的节点即为「泄漏」</p>',
     '  <input type="email" placeholder="邮箱地址">',
@@ -331,6 +347,7 @@
       var missText = '未能在当前预览中定位该节点（可能刚被移除或选择器已变化）。';
       if (state.highlightOrigin === 'modal') setModalHint(missText);
       else if (state.highlightOrigin === 'visual') setVisualHint(missText);
+      else if (state.highlightOrigin === 'name') setNameHint(missText);
       else setDiffHint(missText);
       state.highlightOrigin = null;
     } else if (d.type === 'error') {
@@ -345,6 +362,7 @@
     state.diagnostics = payload.diagnostics || [];
     state.modalAudit = payload.modalAudit || null;
     state.visualAudit = payload.visualAudit || null;
+    state.nameAudit = payload.nameAudit || null;
     state.stats = payload.stats || null;
     state.currentStep = -1;
     renderResults();
@@ -563,6 +581,7 @@
 
     renderModalAudit();
     renderVisualAudit();
+    renderNameAudit();
   }
 
   /* ---------------- 模态焦点陷阱审计 ---------------- */
@@ -927,6 +946,143 @@
     });
   }
 
+  /* ---------------- 控件名称审计 ---------------- */
+
+  var NAME_SOURCE_META = {
+    'aria-labelledby': { label: 'aria-labelledby', cls: 'src-labelledby' },
+    'aria-label': { label: 'aria-label', cls: 'src-label' },
+    'label': { label: '原生 label', cls: 'src-native-label' },
+    'content': { label: '内容', cls: 'src-content' },
+    'title': { label: 'title', cls: 'src-title' }
+  };
+
+  function setNameHint(text) {
+    els.nameHint.textContent = text || '';
+  }
+
+  function clearNameActive() {
+    var all = els.namePanel.querySelectorAll('.node-item.active');
+    for (var i = 0; i < all.length; i++) all[i].classList.remove('active');
+  }
+
+  function renderNameAudit() {
+    var audit = state.nameAudit;
+    els.nameList.innerHTML = '';
+    els.nameMeta.textContent = '';
+    setNameHint('');
+
+    if (!audit) {
+      els.nameCount.textContent = '0';
+      var tip0 = document.createElement('li');
+      tip0.className = 'empty-tip';
+      tip0.textContent = '尚无审计结果。';
+      els.nameList.appendChild(tip0);
+      return;
+    }
+
+    var items = audit.items || [];
+    var st = audit.stats || {};
+    // 角标计数 = 缺名数 + 无法判定数
+    els.nameCount.textContent = String((st.missing || 0) + (st.undetermined || 0));
+    els.nameMeta.textContent =
+      '审计范围 ' + (audit.scope || 'button, a[href], input[type=text]') +
+      ' · 共 ' + (st.total || 0) + ' 个控件：已命名 ' + (st.named || 0) +
+      ' · 缺名 ' + (st.missing || 0) + ' · 无法判定 ' + (st.undetermined || 0);
+
+    if (items.length === 0) {
+      var tip = document.createElement('li');
+      tip.className = 'empty-tip';
+      tip.textContent = '组合树内没有 button、a[href] 或 input[type=text] 控件（未分配 / closed 不可确定的子树不参与审计）。';
+      els.nameList.appendChild(tip);
+      return;
+    }
+
+    items.forEach(function (it) {
+      var li = document.createElement('li');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'node-item name-item ' + it.status;
+
+      var line = document.createElement('span');
+      var no = document.createElement('span');
+      no.className = 'step-no';
+      no.textContent = it.step ? String(it.step) : '–';
+      no.title = it.step ? 'Tab 顺序第 ' + it.step + ' 位' : '不在 Tab 顺序中';
+      line.appendChild(no);
+      line.appendChild(document.createTextNode(' ' + it.label));
+
+      if (it.status === 'named') {
+        var meta = NAME_SOURCE_META[it.source] || { label: it.source, cls: '' };
+        var bSrc = document.createElement('span');
+        bSrc.className = 'badge name-src ' + meta.cls;
+        bSrc.textContent = meta.label;
+        bSrc.title = '名称来源：' + meta.label;
+        line.appendChild(bSrc);
+      } else if (it.status === 'missing') {
+        var bMiss = document.createElement('span');
+        bMiss.className = 'badge name-missing';
+        bMiss.textContent = '缺名';
+        line.appendChild(bMiss);
+      } else {
+        var bUnd = document.createElement('span');
+        bUnd.className = 'badge name-undetermined';
+        bUnd.textContent = '无法判定';
+        line.appendChild(bUnd);
+      }
+      if (it.focusStatus === 'excluded') {
+        var bEx = document.createElement('span');
+        bEx.className = 'badge';
+        bEx.textContent = '已排除';
+        bEx.title = '该控件当前被排除在 Tab 顺序之外（详见「排除与诊断」）';
+        line.appendChild(bEx);
+      } else if (it.focusStatus === 'programmatic') {
+        var bPr = document.createElement('span');
+        bPr.className = 'badge';
+        bPr.textContent = 'tabindex<0';
+        bPr.title = '仅可编程聚焦，不在 Tab 顺序中';
+        line.appendChild(bPr);
+      }
+      btn.appendChild(line);
+
+      appendShadowBadges(btn, { shadow: it.shadow, reasons: [] });
+
+      // 名称 / 缺名·歧义原因行
+      var nameLine = document.createElement('span');
+      if (it.status === 'named') {
+        nameLine.className = 'name-value';
+        nameLine.textContent = '“' + it.name + '”';
+        nameLine.title = it.name;
+      } else {
+        nameLine.className = 'name-reason ' + it.status;
+        nameLine.textContent = it.message;
+      }
+      btn.appendChild(nameLine);
+
+      // 引用诊断（如 aria-labelledby 缺失 id）
+      (it.diagnostics || []).forEach(function (dg) {
+        var dEl = document.createElement('span');
+        dEl.className = 'reason';
+        dEl.textContent = '⚠ ' + dg.message;
+        btn.appendChild(dEl);
+      });
+
+      var sel = document.createElement('span');
+      sel.className = 'sel';
+      sel.textContent = it.selector;
+      btn.appendChild(sel);
+
+      btn.addEventListener('click', function () {
+        clearNameActive();
+        btn.classList.add('active');
+        setNameHint('');
+        state.highlightOrigin = 'name';
+        sendToFrame({ type: 'highlight-node', selector: it.selector, solid: true });
+      });
+      li.appendChild(btn);
+      els.nameList.appendChild(li);
+    });
+  }
+
   /* ---------------- 基线对比 ---------------- */
 
   var DIFF_TYPE_META = {
@@ -1220,6 +1376,13 @@
         undetermined: state.visualAudit.undetermined,
         stats: state.visualAudit.stats
       } : null,
+      // 控件名称审计：button / a[href] / input[type=text] 的可访问名称、
+      // 名称来源与缺名 / 歧义原因（含 aria-labelledby 引用诊断）
+      nameAudit: state.nameAudit ? {
+        scope: state.nameAudit.scope,
+        items: state.nameAudit.items,
+        stats: state.nameAudit.stats
+      } : null,
       // 基线对比：基线摘要 + 匹配结果 + 差异（未钉基线时为 null）
       baselineComparison: state.diff ? {
         baseline: state.diff.baseline,
@@ -1263,6 +1426,7 @@
       excluded: [els.tabExcluded, els.excludedPanel],
       modal: [els.tabModal, els.modalPanel],
       visual: [els.tabVisual, els.visualPanel],
+      name: [els.tabName, els.namePanel],
       baseline: [els.tabBaseline, els.baselinePanel]
     };
     Object.keys(tabs).forEach(function (name) {
@@ -1276,6 +1440,7 @@
   els.tabExcluded.addEventListener('click', function () { switchTab('excluded'); });
   els.tabModal.addEventListener('click', function () { switchTab('modal'); });
   els.tabVisual.addEventListener('click', function () { switchTab('visual'); });
+  els.tabName.addEventListener('click', function () { switchTab('name'); });
   els.tabBaseline.addEventListener('click', function () { switchTab('baseline'); });
 
   /* ---------------- 启动 ---------------- */
@@ -1288,6 +1453,7 @@
   els.css.value = SAMPLE_CSS;
   renderBaselinePanel();
   renderVisualAudit();
+  renderNameAudit();
 
   fetch('/analyzer.js')
     .then(function (res) {
